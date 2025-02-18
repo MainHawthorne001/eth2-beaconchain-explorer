@@ -3,17 +3,18 @@ package db
 import (
 	"context"
 	"database/sql"
-	"eth2-exporter/cache"
-	"eth2-exporter/metrics"
-	"eth2-exporter/price"
-	"eth2-exporter/rpc"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math/big"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5"
@@ -1636,7 +1637,7 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 				totalBlobCount = totalBlobCount.Add(decimal.NewFromInt(int64(len(tx.BlobVersionedHashes))))
 
 			default:
-				logger.Fatalf("error unknown tx type %v hash: %x", tx.Status, tx.Hash)
+				logger.Fatalf("error unknown tx type %v hash: %x", tx.Type, tx.Hash)
 			}
 			totalTxFees = totalTxFees.Add(txFees)
 
@@ -1645,7 +1646,7 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 				failedTxCount += 1
 				totalFailedGasUsed = totalFailedGasUsed.Add(gasUsed)
 				totalFailedTxFee = totalFailedTxFee.Add(txFees)
-			case 1:
+			case 1, 2:
 				successTxCount += 1
 			default:
 				logger.Fatalf("error unknown status code %v hash: %x", tx.Status, tx.Hash)
@@ -1875,5 +1876,49 @@ func CheckIfDayIsFinalized(day uint64) error {
 		return fmt.Errorf("delaying statistics export as not all epochs for day %v are finalized. Last epoch of the day [%v] last finalized epoch [%v]", day, lastEpoch, latestFinalizedEpoch)
 	}
 
+	return nil
+}
+
+func AggregateDeposits() error {
+	start := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("statistics_aggregate_eth1_deposits").Observe(time.Since(start).Seconds())
+	}()
+	_, err := WriterDb.Exec(`
+		INSERT INTO eth1_deposits_aggregated (from_address, amount, validcount, invalidcount, slashedcount, totalcount, activecount, pendingcount, voluntary_exit_count)
+		SELECT
+			eth1.from_address,
+			SUM(eth1.amount) as amount,
+			SUM(eth1.validcount) AS validcount,
+			SUM(eth1.invalidcount) AS invalidcount,
+			COUNT(CASE WHEN v.status = 'slashed' THEN 1 END) AS slashedcount,
+			COUNT(v.pubkey) AS totalcount,
+			COUNT(CASE WHEN v.status = 'active_online' OR v.status = 'active_offline' THEN 1 END) as activecount,
+			COUNT(CASE WHEN v.status = 'deposited' THEN 1 END) AS pendingcount,
+			COUNT(CASE WHEN v.status = 'exited' THEN 1 END) AS voluntary_exit_count
+		FROM (
+			SELECT
+				from_address,
+				publickey,
+				SUM(amount) AS amount,
+				COUNT(CASE WHEN valid_signature = 't' THEN 1 END) AS validcount,
+				COUNT(CASE WHEN valid_signature = 'f' THEN 1 END) AS invalidcount
+			FROM eth1_deposits
+			GROUP BY from_address, publickey
+		) eth1
+		LEFT JOIN (SELECT pubkey, status FROM validators) v ON v.pubkey = eth1.publickey
+		GROUP BY eth1.from_address
+		ON CONFLICT (from_address) DO UPDATE SET
+			amount               = excluded.amount,
+			validcount           = excluded.validcount,
+			invalidcount         = excluded.invalidcount,
+			slashedcount         = excluded.slashedcount,
+			totalcount           = excluded.totalcount,
+			activecount          = excluded.activecount,
+			pendingcount         = excluded.pendingcount,
+			voluntary_exit_count = excluded.voluntary_exit_count`)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	return nil
 }

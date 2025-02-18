@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"firebase.google.com/go/messaging"
+	"firebase.google.com/go/v4/messaging"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/lib/pq"
@@ -614,4 +614,9 @@ type SearchValidatorsByEth1Result []struct {
 	Eth1Address      string        `db:"from_address_text" json:"eth1_address"`
 	ValidatorIndices pq.Int64Array `db:"validatorindices" json:"validator_indices"`
 	Count            uint64        `db:"count" json:"-"`
+}
+
+type ValidatorStateCountRow struct {
+	Name  string `db:"status"`
+	Count uint64 `db:"validator_count"`
 }

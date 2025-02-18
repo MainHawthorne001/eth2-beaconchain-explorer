@@ -2,12 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"net/http"
 	"strconv"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/juliangruber/go-intersect"
 )
@@ -100,8 +101,24 @@ func ValidatorsSlashingsData(w http.ResponseWriter, r *http.Request) {
 
 	tableData := make([][]interface{}, 0, len(slashings))
 
-	validatorNames, err := db.GetValidatorNames()
+	validatorsForNameSearch := []uint64{}
+	for _, slashing := range slashings {
+		validatorsForNameSearch = append(validatorsForNameSearch, slashing.Proposer)
+		if slashing.Type == "Attestation Violation" {
+			inter := intersect.Simple(slashing.Attestestation1Indices, slashing.Attestestation2Indices)
+			if len(inter) == 0 {
+				logger.Warningf("No intersection found for attestation violation, proposer: %v, slot: %v", slashing.Proposer, slashing.Slot)
+			}
+			for _, v := range inter {
+				validatorsForNameSearch = append(validatorsForNameSearch, uint64(v.(int64)))
+			}
+		}
+		if slashing.Type == "Proposer Violation" {
+			validatorsForNameSearch = append(validatorsForNameSearch, *slashing.SlashedValidator)
+		}
+	}
 
+	validatorNames, err := db.GetValidatorNames(validatorsForNameSearch)
 	if err != nil {
 		logger.Errorf("error retrieving validator names from the database: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)

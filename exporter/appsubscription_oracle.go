@@ -3,14 +3,15 @@ package exporter
 import (
 	"context"
 	"encoding/base64"
-	"eth2-exporter/db"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/Gurpartap/storekit-go"
 	"github.com/awa/go-iap/appstore"
@@ -222,6 +223,21 @@ func rejectReason(valid bool) string {
 	return "expired"
 }
 
+func mapAppleProductID(productID string) string {
+	mappings := map[string]string{
+		"orca.yearly.apple":    "orca.yearly",
+		"orca.apple":           "orca",
+		"dolphin.yearly.apple": "dolphin.yearly",
+		"dolphin.apple":        "dolphin",
+		"guppy.yearly.apple":   "guppy.yearly",
+		"guppy.apple":          "guppy",
+	}
+	if mapped, ok := mappings[productID]; ok {
+		return mapped
+	}
+	return productID
+}
+
 func verifyApple(apple *api.StoreClient, receipt *types.PremiumData) (*VerifyResponse, error) {
 	response := &VerifyResponse{
 		Valid:          false,
@@ -286,7 +302,7 @@ func verifyApple(apple *api.StoreClient, receipt *types.PremiumData) (*VerifyRes
 					response.RejectReason = "invalid_product_id"
 					return response, nil
 				}
-				receipt.ProductID = productId
+				receipt.ProductID = mapAppleProductID(productId)
 
 				expiresDateFloat, ok := claims["expiresDate"].(float64)
 				if !ok {

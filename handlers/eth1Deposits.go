@@ -2,14 +2,15 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
 // Deposits will return information about deposits using a go template
@@ -78,30 +79,12 @@ func Eth1DepositsData(w http.ResponseWriter, r *http.Request) {
 	if length > 100 {
 		length = 100
 	}
-
-	orderColumn := q.Get("order[0][column]")
-	orderByMap := map[string]string{
-		"0": "from_address",
-		"1": "publickey",
-		"2": "withdrawal_credential",
-		"3": "amount",
-		"4": "tx_hash",
-		"5": "block_ts",
-		"6": "block_number",
-		"7": "state",
-		"8": "valid_signature",
-	}
-	orderBy, exists := orderByMap[orderColumn]
-	if !exists {
-		orderBy = "block_ts"
-	}
-
 	orderDir := q.Get("order[0][dir]")
 
 	latestEpoch := services.LatestEpoch()
 	validatorOnlineThresholdSlot := GetValidatorOnlineThresholdSlot()
 
-	deposits, depositCount, err := db.GetEth1DepositsJoinEth2Deposits(search, length, start, orderBy, orderDir, latestEpoch, validatorOnlineThresholdSlot)
+	deposits, depositCount, err := db.GetEth1DepositsJoinEth2Deposits(search, length, start, orderDir, latestEpoch, validatorOnlineThresholdSlot)
 	if err != nil {
 		logger.Errorf("GetEth1Deposits error retrieving eth1_deposit data: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)

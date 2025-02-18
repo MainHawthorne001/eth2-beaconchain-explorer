@@ -2,21 +2,25 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"embed"
 	"encoding/hex"
 	"errors"
-	"eth2-exporter/metrics"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math/big"
+	"net"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+
+	_ "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
@@ -25,7 +29,7 @@ import (
 	ethpb "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
 	"github.com/sirupsen/logrus"
 
-	"eth2-exporter/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -35,9 +39,21 @@ var EmbedMigrations embed.FS
 
 var DBPGX *pgxpool.Conn
 
+type SQLReaderDb interface {
+	Close() error
+	Get(dest interface{}, query string, args ...interface{}) error
+	Select(dest interface{}, query string, args ...interface{}) error
+	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	Query(query string, args ...any) (*sql.Rows, error)
+	Preparex(query string) (*sqlx.Stmt, error)
+	Rebind(query string) string
+}
+
 // DB is a pointer to the explorer-database
 var WriterDb *sqlx.DB
-var ReaderDb *sqlx.DB
+var ReaderDb SQLReaderDb
+
+var ClickhouseReaderDb *sqlx.DB
 
 var logger = logrus.StandardLogger().WithField("module", "db")
 
@@ -70,60 +86,101 @@ func dbTestConnection(dbConn *sqlx.DB, dataBaseName string) {
 	dbConnectionTimeout.Stop()
 }
 
-func mustInitDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig) (*sqlx.DB, *sqlx.DB) {
-
-	if writer.MaxOpenConns == 0 {
-		writer.MaxOpenConns = 50
-	}
-	if writer.MaxIdleConns == 0 {
-		writer.MaxIdleConns = 10
-	}
-	if writer.MaxOpenConns < writer.MaxIdleConns {
-		writer.MaxIdleConns = writer.MaxOpenConns
+func mustInitDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig, driverName string, databaseBrand string) (*sqlx.DB, *sqlx.DB) {
+	if writer == nil && reader == nil {
+		logger.Fatal("no database configuration provided", 0)
 	}
 
-	if reader.MaxOpenConns == 0 {
-		reader.MaxOpenConns = 50
-	}
-	if reader.MaxIdleConns == 0 {
-		reader.MaxIdleConns = 10
-	}
-	if reader.MaxOpenConns < reader.MaxIdleConns {
-		reader.MaxIdleConns = reader.MaxOpenConns
-	}
+	var dbConnWriter, dbConnReader *sqlx.DB
+	var err error
+	if writer != nil {
+		sslParam := ""
+		if driverName == "clickhouse" {
+			sslParam = "secure=false"
+			if writer.SSL {
+				sslParam = "secure=true"
+			}
+			// debug
+			// sslParam += "&debug=true"
+		} else {
+			sslParam = "sslmode=disable"
+			if writer.SSL {
+				sslParam = "sslmode=require"
+			}
+		}
+		if writer.MaxOpenConns == 0 {
+			writer.MaxOpenConns = 50
+		}
+		if writer.MaxIdleConns == 0 {
+			writer.MaxIdleConns = 10
+		}
+		if writer.MaxOpenConns < writer.MaxIdleConns {
+			writer.MaxIdleConns = writer.MaxOpenConns
+		}
 
-	logger.Infof("initializing writer db connection to %v with %v/%v conn limit", writer.Host, writer.MaxIdleConns, writer.MaxOpenConns)
-	dbConnWriter, err := sqlx.Open("pgx", fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", writer.Username, writer.Password, writer.Host, writer.Port, writer.Name))
-	if err != nil {
-		utils.LogFatal(err, "error getting Connection Writer database", 0)
-	}
+		logger.Infof("connecting to %s database %s:%s/%s as writer with %d/%d max open/idle connections", databaseBrand, writer.Host, writer.Port, writer.Name, writer.MaxOpenConns, writer.MaxIdleConns)
+		dbConnWriter, err = sqlx.Open(driverName, fmt.Sprintf("%s://%s:%s@%s/%s?%s", databaseBrand, writer.Username, writer.Password, net.JoinHostPort(writer.Host, writer.Port), writer.Name, sslParam))
+		if err != nil {
+			logger.Fatal(err, "error getting Connection Writer database", 0)
+		}
 
-	dbTestConnection(dbConnWriter, "database")
-	dbConnWriter.SetConnMaxIdleTime(time.Second * 30)
-	dbConnWriter.SetConnMaxLifetime(time.Minute)
-	dbConnWriter.SetMaxOpenConns(writer.MaxOpenConns)
-	dbConnWriter.SetMaxIdleConns(writer.MaxIdleConns)
+		dbTestConnection(dbConnWriter, fmt.Sprintf("database %v:%v/%v", writer.Host, writer.Port, writer.Name))
+		dbConnWriter.SetConnMaxIdleTime(time.Second * 30)
+		dbConnWriter.SetConnMaxLifetime(time.Minute)
+		dbConnWriter.SetMaxOpenConns(writer.MaxOpenConns)
+		dbConnWriter.SetMaxIdleConns(writer.MaxIdleConns)
+	}
 
 	if reader == nil {
 		return dbConnWriter, dbConnWriter
 	}
 
-	logger.Infof("initializing reader db connection to %v with %v/%v conn limit", writer.Host, reader.MaxIdleConns, reader.MaxOpenConns)
-	dbConnReader, err := sqlx.Open("pgx", fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", reader.Username, reader.Password, reader.Host, reader.Port, reader.Name))
-	if err != nil {
-		utils.LogFatal(err, "error getting Connection Reader database", 0)
-	}
+	if reader != nil {
+		sslParam := ""
+		if driverName == "clickhouse" {
+			sslParam = "secure=false"
+			if reader.SSL {
+				sslParam = "secure=true"
+			}
+			// debug
+			// sslParam += "&debug=true"
+		} else {
+			sslParam = "sslmode=disable"
+			if reader.SSL {
+				sslParam = "sslmode=require"
+			}
+		}
+		if reader.MaxOpenConns == 0 {
+			reader.MaxOpenConns = 50
+		}
+		if reader.MaxIdleConns == 0 {
+			reader.MaxIdleConns = 10
+		}
+		if reader.MaxOpenConns < reader.MaxIdleConns {
+			reader.MaxIdleConns = reader.MaxOpenConns
+		}
 
-	dbTestConnection(dbConnReader, "read replica database")
-	dbConnReader.SetConnMaxIdleTime(time.Second * 30)
-	dbConnReader.SetConnMaxLifetime(time.Minute)
-	dbConnReader.SetMaxOpenConns(reader.MaxOpenConns)
-	dbConnReader.SetMaxIdleConns(reader.MaxIdleConns)
+		logger.Infof("connecting to %s database %s:%s/%s as reader with %d/%d max open/idle connections", databaseBrand, reader.Host, reader.Port, reader.Name, reader.MaxOpenConns, reader.MaxIdleConns)
+		dbConnReader, err = sqlx.Open(driverName, fmt.Sprintf("%s://%s:%s@%s/%s?%s", databaseBrand, reader.Username, reader.Password, net.JoinHostPort(reader.Host, reader.Port), reader.Name, sslParam))
+		if err != nil {
+			logger.Fatal(err, "error getting Connection Reader database", 0)
+		}
+
+		dbTestConnection(dbConnReader, fmt.Sprintf("database %v:%v/%v", reader.Host, reader.Port, reader.Name))
+		dbConnReader.SetConnMaxIdleTime(time.Second * 30)
+		dbConnReader.SetConnMaxLifetime(time.Minute)
+		dbConnReader.SetMaxOpenConns(reader.MaxOpenConns)
+		dbConnReader.SetMaxIdleConns(reader.MaxIdleConns)
+	}
 	return dbConnWriter, dbConnReader
 }
 
-func MustInitDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig) {
-	WriterDb, ReaderDb = mustInitDB(writer, reader)
+func MustInitClickhouseDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig, driverName string, databaseBrand string) {
+	_, ClickhouseReaderDb = mustInitDB(writer, reader, driverName, databaseBrand)
+}
+
+func MustInitDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig, driverName string, databaseBrand string) {
+	WriterDb, ReaderDb = mustInitDB(writer, reader, driverName, databaseBrand)
 }
 
 func ApplyEmbeddedDbSchema(version int64) error {
@@ -150,7 +207,7 @@ func ApplyEmbeddedDbSchema(version int64) error {
 	return nil
 }
 
-func GetEth1DepositsJoinEth2Deposits(query string, length, start uint64, orderBy, orderDir string, latestEpoch, validatorOnlineThresholdSlot uint64) ([]*types.EthOneDepositsData, uint64, error) {
+func GetEth1DepositsJoinEth2Deposits(query string, length, start uint64, orderDir string, latestEpoch, validatorOnlineThresholdSlot uint64) ([]*types.EthOneDepositsData, uint64, error) {
 	// Initialize the return values
 	deposits := []*types.EthOneDepositsData{}
 	totalCount := uint64(0)
@@ -158,17 +215,7 @@ func GetEth1DepositsJoinEth2Deposits(query string, length, start uint64, orderBy
 	if orderDir != "desc" && orderDir != "asc" {
 		orderDir = "desc"
 	}
-	columns := []string{"tx_hash", "tx_input", "tx_index", "block_number", "block_ts", "from_address", "publickey", "withdrawal_credentials", "amount", "signature", "merkletree_index", "state", "valid_signature"}
-	hasColumn := false
-	for _, column := range columns {
-		if orderBy == column {
-			hasColumn = true
-			break
-		}
-	}
-	if !hasColumn {
-		orderBy = "block_ts"
-	}
+	orderBy := "block_ts"
 
 	var param interface{}
 	var searchQuery string
@@ -332,7 +379,7 @@ func GetEth1DepositsLeaderboard(query string, length, start uint64, orderBy, ord
 	return deposits, totalCount, nil
 }
 
-func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir string) ([]*types.EthTwoDepositData, uint64, error) {
+func GetEth2Deposits(query string, length, start uint64, orderDir string) ([]*types.EthTwoDepositData, uint64, error) {
 	// Initialize the return values
 	deposits := []*types.EthTwoDepositData{}
 	totalCount := uint64(0)
@@ -340,30 +387,16 @@ func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir strin
 	if orderDir != "desc" && orderDir != "asc" {
 		orderDir = "desc"
 	}
-	columns := []string{"block_slot", "publickey", "amount", "withdrawalcredentials", "signature"}
-	hasColumn := false
-	for _, column := range columns {
-		if orderBy == column {
-			hasColumn = true
-			break
-		}
-	}
-	if !hasColumn {
-		orderBy = "block_slot"
-	}
+	orderBy := "block_slot"
 
 	var param interface{}
 	var searchQuery string
 	var err error
 
 	// Define the base queries
-	deposistsCountQuery := `
-		SELECT COUNT(*)
-		FROM blocks_deposits
-		INNER JOIN blocks ON blocks_deposits.block_root = blocks.blockroot AND blocks.status = '1'
-		%s`
+	depositsCountQuery := `SELECT COALESCE(SUM(depositscount),0) FROM blocks WHERE status = '1' AND depositscount > 0`
 
-	deposistsQuery := `
+	depositsQuery := `
 			SELECT 
 				blocks_deposits.block_slot,
 				blocks_deposits.block_index,
@@ -389,14 +422,14 @@ func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir strin
 		}
 	}
 	if trimmedQuery == "" {
-		err = ReaderDb.Get(&totalCount, fmt.Sprintf(deposistsCountQuery, ""))
+		err = ReaderDb.Get(&totalCount, depositsCountQuery)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("error getting totalCount without search: %w", err)
 		}
 
-		err = ReaderDb.Select(&deposits, fmt.Sprintf(deposistsQuery, "", orderBy, orderDir), length, start)
+		err = ReaderDb.Select(&deposits, fmt.Sprintf(depositsQuery, "", orderBy, orderDir), length, start)
 		if err != nil && err != sql.ErrNoRows {
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("error selecting deposits without search: %w", err)
 		}
 
 		return deposits, totalCount, nil
@@ -405,33 +438,49 @@ func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir strin
 	if utils.IsHash(trimmedQuery) {
 		param = hash
 		searchQuery = `WHERE blocks_deposits.publickey = $3`
+		depositsCountQuery = `
+			SELECT COALESCE(SUM(depositscount),0)
+			FROM blocks
+			INNER JOIN blocks_deposits ON blocks.blockroot = blocks_deposits.block_root AND blocks_deposits.publickey = $1
+			WHERE status = '1' AND depositscount > 0`
 	} else if utils.IsValidWithdrawalCredentials(trimmedQuery) {
 		param = hash
 		searchQuery = `WHERE blocks_deposits.withdrawalcredentials = $3`
+		depositsCountQuery = `
+			SELECT COALESCE(SUM(depositscount),0)
+			FROM blocks
+			INNER JOIN blocks_deposits ON blocks.blockroot = blocks_deposits.block_root AND blocks_deposits.withdrawalcredentials = $1
+			WHERE status = '1' AND depositscount > 0`
 	} else if utils.IsEth1Address(trimmedQuery) {
 		param = hash
 		searchQuery = `
-				LEFT JOIN eth1_deposits ON blocks_deposits.publickey = eth1_deposits.publickey
-				WHERE eth1_deposits.from_address = $3`
+			LEFT JOIN eth1_deposits ON blocks_deposits.publickey = eth1_deposits.publickey
+			WHERE eth1_deposits.from_address = $3`
+		depositsCountQuery = `
+			SELECT COUNT(*) FROM blocks_deposits 
+			INNER JOIN blocks ON blocks_deposits.block_root = blocks.blockroot AND blocks.status = '1'
+			LEFT JOIN eth1_deposits ON blocks_deposits.publickey = eth1_deposits.publickey
+			WHERE eth1_deposits.from_address = $1`
 	} else if uiQuery, parseErr := strconv.ParseUint(query, 10, 31); parseErr == nil { // Limit to 31 bits to stay within math.MaxInt32
 		param = uiQuery
 		searchQuery = `WHERE blocks_deposits.block_slot = $3`
+		depositsCountQuery = `
+			SELECT COALESCE(SUM(depositscount),0)
+			FROM blocks
+			WHERE status = '1' AND depositscount > 0 AND slot = $1`
 	} else {
 		// The query does not fulfill any of the requirements for a search
 		return deposits, totalCount, nil
 	}
 
-	// The deposits count query only has one parameter for the search
-	countSearchQuery := strings.ReplaceAll(searchQuery, "$3", "$1")
-
-	err = ReaderDb.Get(&totalCount, fmt.Sprintf(deposistsCountQuery, countSearchQuery), param)
-	if err != nil {
-		return nil, 0, err
+	err = ReaderDb.Get(&totalCount, depositsCountQuery, param)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, 0, fmt.Errorf("error getting totalCount: %w", err)
 	}
 
-	err = ReaderDb.Select(&deposits, fmt.Sprintf(deposistsQuery, searchQuery, orderBy, orderDir), length, start, param)
+	err = ReaderDb.Select(&deposits, fmt.Sprintf(depositsQuery, searchQuery, orderBy, orderDir), length, start, param)
 	if err != nil && err != sql.ErrNoRows {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("error selecting deposits: %w", err)
 	}
 
 	return deposits, totalCount, nil
@@ -959,6 +1008,8 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 		return fmt.Errorf("error preparing insert validator statement: %w", err)
 	}
 
+	validatorStatusCounts := make(map[string]int)
+
 	updates := 0
 	for _, v := range validators {
 
@@ -1001,6 +1052,7 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 			if err != nil {
 				logger.Errorf("error saving new validator %v: %v", v.Index, err)
 			}
+			validatorStatusCounts[v.Status]++
 		} else {
 			// status                     =
 			// CASE
@@ -1041,6 +1093,7 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 				v.Status = "active_online"
 			}
 
+			validatorStatusCounts[v.Status]++
 			if c.Status != v.Status {
 				logger.Tracef("Status changed for validator %v from %v to %v", v.Index, c.Status, v.Status)
 				// logger.Tracef("v.ActivationEpoch %v, latestEpoch %v, lastAttestationSlots[v.Index] %v, thresholdSlot %v", v.ActivationEpoch, latestEpoch, lastAttestationSlots[v.Index], thresholdSlot)
@@ -1169,6 +1222,20 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 
 	logger.Infof("updating validator activation epoch balance completed, took %v", time.Since(s))
 
+	logger.Infof("updating validator status counts")
+	s = time.Now()
+	_, err = tx.Exec("TRUNCATE TABLE validators_status_counts;")
+	if err != nil {
+		return fmt.Errorf("error truncating validators_status_counts table: %w", err)
+	}
+	for status, count := range validatorStatusCounts {
+		_, err = tx.Exec("INSERT INTO validators_status_counts (status, validator_count) VALUES ($1, $2);", status, count)
+		if err != nil {
+			return fmt.Errorf("error updating validator status counts: %w", err)
+		}
+	}
+	logger.Infof("updating validator status counts completed, took %v", time.Since(s))
+
 	s = time.Now()
 	_, err = tx.Exec("ANALYZE (SKIP_LOCKED) validators;")
 	if err != nil {
@@ -1212,6 +1279,15 @@ func saveBlocks(blocks map[uint64]map[string]*types.Block, tx *sqlx.Tx, forceSlo
 	if err != nil {
 		return err
 	}
+
+	stmtExecutionPayload, err := tx.Prepare(`
+		INSERT INTO execution_payloads (block_hash)
+		VALUES ($1)
+		ON CONFLICT (block_hash) DO NOTHING`)
+	if err != nil {
+		return err
+	}
+	defer stmtExecutionPayload.Close()
 
 	stmtBlock, err := tx.Prepare(`
 		INSERT INTO blocks (epoch, slot, blockroot, parentroot, stateroot, signature, randaoreveal, graffiti, graffiti_text, eth1data_depositroot, eth1data_depositcount, eth1data_blockhash, syncaggregate_bits, syncaggregate_signature, proposerslashingscount, attesterslashingscount, attestationscount, depositscount, withdrawalcount, voluntaryexitscount, syncaggregate_participation, proposer, status, exec_parent_hash, exec_fee_recipient, exec_state_root, exec_receipts_root, exec_logs_bloom, exec_random, exec_block_number, exec_gas_limit, exec_gas_used, exec_timestamp, exec_extra_data, exec_base_fee_per_gas, exec_block_hash, exec_transactions_count, exec_blob_gas_used, exec_excess_blob_gas, exec_blob_transactions_count)
@@ -1355,43 +1431,57 @@ func saveBlocks(blocks map[uint64]map[string]*types.Block, tx *sqlx.Tx, forceSlo
 				// blockLog = blockLog.WithField("syncParticipation", b.SyncAggregate.SyncAggregateParticipation)
 			}
 
-			parentHash := []byte{}
-			feeRecipient := []byte{}
-			stateRoot := []byte{}
-			receiptRoot := []byte{}
-			logsBloom := []byte{}
-			random := []byte{}
-			blockNumber := uint64(0)
-			gasLimit := uint64(0)
-			gasUsed := uint64(0)
-			timestamp := uint64(0)
-			extraData := []byte{}
-			baseFeePerGas := uint64(0)
-			blockHash := []byte{}
-			txCount := 0
-			withdrawalCount := 0
-			blobGasUsed := uint64(0)
-			excessBlobGas := uint64(0)
-			blobTxCount := 0
+			type exectionPayloadData struct {
+				ParentHash      []byte
+				FeeRecipient    []byte
+				StateRoot       []byte
+				ReceiptRoot     []byte
+				LogsBloom       []byte
+				Random          []byte
+				BlockNumber     *uint64
+				GasLimit        *uint64
+				GasUsed         *uint64
+				Timestamp       *uint64
+				ExtraData       []byte
+				BaseFeePerGas   *uint64
+				BlockHash       []byte
+				TxCount         *int64
+				WithdrawalCount *int64
+				BlobGasUsed     *uint64
+				ExcessBlobGas   *uint64
+				BlobTxCount     *int64
+			}
+
+			execData := new(exectionPayloadData)
+
 			if b.ExecutionPayload != nil {
-				parentHash = b.ExecutionPayload.ParentHash
-				feeRecipient = b.ExecutionPayload.FeeRecipient
-				stateRoot = b.ExecutionPayload.StateRoot
-				receiptRoot = b.ExecutionPayload.ReceiptsRoot
-				logsBloom = b.ExecutionPayload.LogsBloom
-				random = b.ExecutionPayload.Random
-				blockNumber = b.ExecutionPayload.BlockNumber
-				gasLimit = b.ExecutionPayload.GasLimit
-				gasUsed = b.ExecutionPayload.GasUsed
-				timestamp = b.ExecutionPayload.Timestamp
-				extraData = b.ExecutionPayload.ExtraData
-				baseFeePerGas = b.ExecutionPayload.BaseFeePerGas
-				blockHash = b.ExecutionPayload.BlockHash
-				txCount = len(b.ExecutionPayload.Transactions)
-				withdrawalCount = len(b.ExecutionPayload.Withdrawals)
-				blobGasUsed = b.ExecutionPayload.BlobGasUsed
-				excessBlobGas = b.ExecutionPayload.ExcessBlobGas
-				blobTxCount = len(b.BlobKZGCommitments)
+				txCount := int64(len(b.ExecutionPayload.Transactions))
+				withdrawalCount := int64(len(b.ExecutionPayload.Withdrawals))
+				blobTxCount := int64(len(b.BlobKZGCommitments))
+				execData = &exectionPayloadData{
+					ParentHash:      b.ExecutionPayload.ParentHash,
+					FeeRecipient:    b.ExecutionPayload.FeeRecipient,
+					StateRoot:       b.ExecutionPayload.StateRoot,
+					ReceiptRoot:     b.ExecutionPayload.ReceiptsRoot,
+					LogsBloom:       b.ExecutionPayload.LogsBloom,
+					Random:          b.ExecutionPayload.Random,
+					BlockNumber:     &b.ExecutionPayload.BlockNumber,
+					GasLimit:        &b.ExecutionPayload.GasLimit,
+					GasUsed:         &b.ExecutionPayload.GasUsed,
+					Timestamp:       &b.ExecutionPayload.Timestamp,
+					ExtraData:       b.ExecutionPayload.ExtraData,
+					BaseFeePerGas:   &b.ExecutionPayload.BaseFeePerGas,
+					BlockHash:       b.ExecutionPayload.BlockHash,
+					TxCount:         &txCount,
+					WithdrawalCount: &withdrawalCount,
+					BlobGasUsed:     &b.ExecutionPayload.BlobGasUsed,
+					ExcessBlobGas:   &b.ExecutionPayload.ExcessBlobGas,
+					BlobTxCount:     &blobTxCount,
+				}
+				_, err = stmtExecutionPayload.Exec(execData.BlockHash)
+				if err != nil {
+					return fmt.Errorf("error executing stmtExecutionPayload for block %v: %w", b.Slot, err)
+				}
 			}
 			_, err = stmtBlock.Exec(
 				b.Slot/utils.Config.Chain.ClConfig.SlotsPerEpoch,
@@ -1412,28 +1502,28 @@ func saveBlocks(blocks map[uint64]map[string]*types.Block, tx *sqlx.Tx, forceSlo
 				len(b.AttesterSlashings),
 				len(b.Attestations),
 				len(b.Deposits),
-				withdrawalCount,
+				execData.WithdrawalCount,
 				len(b.VoluntaryExits),
 				syncAggParticipation,
 				b.Proposer,
 				strconv.FormatUint(b.Status, 10),
-				parentHash,
-				feeRecipient,
-				stateRoot,
-				receiptRoot,
-				logsBloom,
-				random,
-				blockNumber,
-				gasLimit,
-				gasUsed,
-				timestamp,
-				extraData,
-				baseFeePerGas,
-				blockHash,
-				txCount,
-				blobGasUsed,
-				excessBlobGas,
-				blobTxCount,
+				execData.ParentHash,
+				execData.FeeRecipient,
+				execData.StateRoot,
+				execData.ReceiptRoot,
+				execData.LogsBloom,
+				execData.Random,
+				execData.BlockNumber,
+				execData.GasLimit,
+				execData.GasUsed,
+				execData.Timestamp,
+				execData.ExtraData,
+				execData.BaseFeePerGas,
+				execData.BlockHash,
+				execData.TxCount,
+				execData.BlobGasUsed,
+				execData.ExcessBlobGas,
+				execData.BlobTxCount,
 			)
 			if err != nil {
 				return fmt.Errorf("error executing stmtBlocks for block %v: %w", b.Slot, err)
@@ -1714,12 +1804,13 @@ func GetQueueAheadOfValidator(validatorIndex uint64) (uint64, error) {
 	return res, err
 }
 
-func GetValidatorNames() (map[uint64]string, error) {
+func GetValidatorNames(validators []uint64) (map[uint64]string, error) {
+	logger.Infof("getting validator names for %d validators", len(validators))
 	rows, err := ReaderDb.Query(`
 		SELECT validatorindex, validator_names.name 
 		FROM validators 
 		LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-		WHERE validator_names.name IS NOT NULL`)
+		WHERE validators.validatorindex = ANY($1) AND validator_names.name IS NOT NULL`, pq.Array(validators))
 
 	if err != nil {
 		return nil, err
@@ -2177,10 +2268,9 @@ func GetTotalAmountWithdrawn() (sum uint64, count uint64, err error) {
 func GetTotalAmountDeposited() (uint64, error) {
 	var total uint64
 	err := ReaderDb.Get(&total, `
-	SELECT 
-		COALESCE(sum(d.amount), 0) as sum 
-	FROM blocks_deposits d
-	INNER JOIN blocks b ON b.blockroot = d.block_root AND b.status = '1'`)
+	SELECT COALESCE(sum(d.amount), 0) as sum 
+	FROM blocks_deposits d 
+	INNER JOIN blocks b ON b.slot = d.block_slot AND b.blockroot = d.block_root WHERE b.status = '1' AND b.depositscount > 0;`)
 	return total, err
 }
 

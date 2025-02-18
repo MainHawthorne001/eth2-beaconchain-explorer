@@ -9,13 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/db"
-	ethclients "eth2-exporter/ethClients"
-	"eth2-exporter/mail"
-	"eth2-exporter/metrics"
-	"eth2-exporter/notify"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"html"
 	"html/template"
@@ -27,8 +20,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	ethclients "github.com/gobitfly/eth2-beaconchain-explorer/ethClients"
+	"github.com/gobitfly/eth2-beaconchain-explorer/mail"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/notify"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+
 	gcp_bigtable "cloud.google.com/go/bigtable"
-	"firebase.google.com/go/messaging"
+	"firebase.google.com/go/v4/messaging"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
@@ -610,7 +611,7 @@ func sendPushNotifications(useDB *sqlx.DB) error {
 				end = len(n.Content.Messages)
 			}
 
-			err = notify.SendPushBatch(n.Content.Messages[start:end])
+			err = notify.SendPushBatch(n.Content.Messages[start:end], false)
 			if err != nil {
 				metrics.Errors.WithLabelValues("notifications_send_push_batch").Inc()
 				logger.WithError(err).Error("error sending firebase batch job")
@@ -997,7 +998,7 @@ func sendWebhookNotifications(useDB *sqlx.DB) error {
 			}
 			resp, err := client.Post(n.Content.Webhook.Url, "application/json", reqBody)
 			if err != nil {
-				logger.WithError(err).Errorf("error sending request")
+				logger.WithError(err).Warnf("error sending request")
 			} else {
 				metrics.NotificationsSent.WithLabelValues("webhook", resp.Status).Inc()
 			}
@@ -1020,11 +1021,11 @@ func sendWebhookNotifications(useDB *sqlx.DB) error {
 				if resp != nil {
 					b, err := io.ReadAll(resp.Body)
 					if err != nil {
-						logger.WithError(err).Error("error reading body")
+						logger.WithError(err).Warn("error reading body")
+					} else {
+						errResp.Status = resp.Status
+						errResp.Body = string(b)
 					}
-
-					errResp.Status = resp.Status
-					errResp.Body = string(b)
 				}
 
 				_, err = useDB.Exec(`UPDATE users_webhooks SET retries = retries + 1, last_sent = now(), request = $2, response = $3 WHERE id = $1;`, n.Content.Webhook.ID, n.Content, errResp)
@@ -1139,7 +1140,7 @@ func sendDiscordNotifications(useDB *sqlx.DB) error {
 					if strings.Contains(errResp.Body, "You are being rate limited") {
 						logger.Warnf("could not push to discord webhook due to rate limit. %v url: %v", errResp.Body, webhook.Url)
 					} else {
-						utils.LogError(nil, "error pushing discord webhook", 0, map[string]interface{}{"errResp.Body": errResp.Body, "webhook.Url": webhook.Url})
+						utils.LogWarn(nil, "error pushing discord webhook", 0, map[string]interface{}{"errResp.Body": errResp.Body, "webhook.Url": webhook.Url})
 					}
 					_, err = useDB.Exec(`UPDATE users_webhooks SET request = $2, response = $3 WHERE id = $1;`, webhook.ID, reqs[i].Content.DiscordRequest, errResp)
 					if err != nil {
@@ -1320,6 +1321,8 @@ func (n *validatorProposalNotification) GetInfo(includeUrl bool) string {
 		generalPart = fmt.Sprintf(`Validator %s proposed block at slot %s with %v %v execution reward.`, vali, slot, n.Reward, utils.Config.Frontend.ElCurrency)
 	case 2:
 		generalPart = fmt.Sprintf(`Validator %s missed a block proposal at slot %s.`, vali, slot)
+	case 3:
+		generalPart = fmt.Sprintf(`Validator %s had an orphaned block proposal at slot %s.`, vali, slot)
 	}
 	return generalPart + suffix
 }
@@ -1332,6 +1335,8 @@ func (n *validatorProposalNotification) GetTitle() string {
 		return "New Block Proposal"
 	case 2:
 		return "Block Proposal Missed"
+	case 3:
+		return "Block Proposal Missed (Orphaned)"
 	}
 	return "-"
 }
@@ -1349,6 +1354,8 @@ func (n *validatorProposalNotification) GetInfoMarkdown() string {
 		generalPart = fmt.Sprintf(`Validator [%[2]v](https://%[1]v/validator/%[2]v) proposed a new block at slot [%[3]v](https://%[1]v/slot/%[3]v) with %[4]v %[5]v execution reward.`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot, n.Reward, utils.Config.Frontend.ElCurrency)
 	case 2:
 		generalPart = fmt.Sprintf(`Validator [%[2]v](https://%[1]v/validator/%[2]v) missed a block proposal at slot [%[3]v](https://%[1]v/slot/%[3]v).`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot)
+	case 3:
+		generalPart = fmt.Sprintf(`Validator [%[2]v](https://%[1]v/validator/%[2]v) had an orphaned block proposal at slot [%[3]v](https://%[1]v/slot/%[3]v).`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot)
 	}
 
 	return generalPart
@@ -2091,7 +2098,7 @@ func (n *ethClientNotification) GetInfo(includeUrl bool) string {
 		case "Lighthouse":
 			url = "https://github.com/sigp/lighthouse/releases"
 		case "Erigon":
-			url = "https://github.com/ledgerwatch/erigon/releases"
+			url = "https://github.com/erigontech/erigon/releases"
 		case "Rocketpool":
 			url = "https://github.com/rocket-pool/smartnode-install/releases"
 		case "MEV-Boost":
@@ -2131,7 +2138,7 @@ func (n *ethClientNotification) GetInfoMarkdown() string {
 	case "Lighthouse":
 		url = "https://github.com/sigp/lighthouse/releases"
 	case "Erigon":
-		url = "https://github.com/ledgerwatch/erigon/releases"
+		url = "https://github.com/erigontech/erigon/releases"
 	case "Rocketpool":
 		url = "https://github.com/rocket-pool/smartnode-install/releases"
 	case "MEV-Boost":

@@ -3,14 +3,15 @@ package handlers
 import (
 	"database/sql"
 	"errors"
-	"eth2-exporter/db"
-	"eth2-exporter/mail"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/mail"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"net/http"
 
@@ -165,6 +166,20 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		Flashes:      utils.GetFlashes(w, r, authSessionName),
 		CsrfField:    csrf.TemplateField(r),
 		RecaptchaKey: utils.Config.Frontend.RecaptchaSiteKey,
+	}
+
+	if redirect := q.Get("redirect"); redirect != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:   "redirect-after",
+			Value:  redirect,
+			MaxAge: 300,
+		})
+	} else if redirect := q.Get("redirect_uri"); redirect != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:   "redirect-after",
+			Value:  redirect + "&state=" + q.Get("state"),
+			MaxAge: 300,
+		})
 	}
 
 	redirectData := struct {
@@ -335,6 +350,12 @@ func LoginPost(w http.ResponseWriter, r *http.Request) {
 
 	if redirectParam != "" {
 		http.Redirect(w, r, "/user/authorize"+redirectParam, http.StatusSeeOther)
+		return
+	}
+
+	cookie, err := r.Cookie("redirect-after")
+	if err == nil && cookie.Value != "" {
+		http.Redirect(w, r, cookie.Value, http.StatusSeeOther)
 		return
 	}
 

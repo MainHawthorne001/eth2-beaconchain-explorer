@@ -8,12 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/db"
-	"eth2-exporter/exporter"
-	"eth2-exporter/price"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"io"
 	"math/big"
@@ -24,6 +18,14 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/exporter"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/common"
 	gorillacontext "github.com/gorilla/context"
@@ -255,6 +257,34 @@ func ApiEthStoreDay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	returnQueryResults(rows, w, r, addDayTime)
+}
+
+// ApiLatestState godoc
+// @Summary Get the latest state of the network
+// @Tags Network
+// @Description Returns information on the current state of the network
+// @Produce  json
+// @Failure 400 {object} types.ApiResponse "Failure"
+// @Failure 500 {object} types.ApiResponse "Server Error"
+// @Router /api/v1/latestState [get]
+func ApiLatestState(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", utils.Config.Chain.ClConfig.SecondsPerSlot)) // set local cache to the seconds per slot interval
+
+	data := services.LatestState()
+	data.Rates = services.GetRates(GetCurrency(r))
+	userAgent := r.Header.Get("User-Agent")
+	userAgent = strings.ToLower(userAgent)
+	if strings.Contains(userAgent, "android") || strings.Contains(userAgent, "iphone") || strings.Contains(userAgent, "windows phone") {
+		data.Rates.MainCurrencyPriceFormatted = utils.KFormatterEthPrice(uint64(data.Rates.MainCurrencyPrice))
+	}
+
+	err := json.NewEncoder(w).Encode(data)
+	if err != nil {
+		logger.Errorf("error sending latest index page data: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
 // ApiEpoch godoc
@@ -3614,19 +3644,24 @@ func clientStatsPost(w http.ResponseWriter, r *http.Request, apiKey, machine str
 		return
 	}
 
+	userDataRetrievalStartTs := time.Now()
 	userData, err := db.GetUserIdByApiKey(apiKey)
 	if err != nil {
 		SendBadRequestResponse(w, r.URL.String(), "no user found with api key")
 		return
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_user_data_retrieve").Observe(time.Since(userDataRetrievalStartTs).Seconds())
 
+	bodyDataReadingStartTs := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		logger.Warnf("error reading body | err: %v", err)
 		SendBadRequestResponse(w, r.URL.String(), "could not read body")
 		return
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_body_data_read").Observe(time.Since(bodyDataReadingStartTs).Seconds())
 
+	bodyDataParseStartTs := time.Now()
 	var jsonObjects []map[string]interface{}
 	err = json.Unmarshal(body, &jsonObjects)
 	if err != nil {
@@ -3645,6 +3680,7 @@ func clientStatsPost(w http.ResponseWriter, r *http.Request, apiKey, machine str
 		SendBadRequestResponse(w, r.URL.String(), "Max number of stat entries are 10")
 		return
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_body_data_parse").Observe(time.Since(bodyDataParseStartTs).Seconds())
 
 	var rateLimitErrs = 0
 	var result bool = false
@@ -3674,7 +3710,7 @@ func clientStatsPost(w http.ResponseWriter, r *http.Request, apiKey, machine str
 }
 
 func insertStats(userData *types.UserWithPremium, machine string, body *map[string]interface{}, w http.ResponseWriter, r *http.Request) error {
-
+	dataParseStartTs := time.Now()
 	var parsedMeta *types.StatsMeta
 	err := mapstructure.Decode(body, &parsedMeta)
 	if err != nil {
@@ -3694,9 +3730,13 @@ func insertStats(userData *types.UserWithPremium, machine string, body *map[stri
 		SendBadRequestResponse(w, r.URL.String(), "unknown process")
 		return fmt.Errorf("unknown process")
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_parse").Observe(time.Since(dataParseStartTs).Seconds())
 
+	getUserPremiumByPackageStartTs := time.Now()
 	maxNodes := GetUserPremiumByPackage(userData.Product.String).MaxNodes
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_get_premium").Observe(time.Since(getUserPremiumByPackageStartTs).Seconds())
 
+	getMachineMetricsMachineCountStartTs := time.Now()
 	count, err := db.BigtableClient.GetMachineMetricsMachineCount(userData.ID)
 	if err != nil {
 		logger.Errorf("Could not get max machine count| %v", err)
@@ -3708,7 +3748,9 @@ func insertStats(userData *types.UserWithPremium, machine string, body *map[stri
 		sendErrorWithCodeResponse(w, r.URL.String(), "reached max machine count", 402)
 		return fmt.Errorf("user has reached max machine count")
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_get_machine_count").Observe(time.Since(getMachineMetricsMachineCountStartTs).Seconds())
 
+	dataEncodeStartTs := time.Now()
 	var data []byte
 	if parsedMeta.Process == "system" {
 		var parsedResponse *types.MachineMetricSystem
@@ -3753,6 +3795,7 @@ func insertStats(userData *types.UserWithPremium, machine string, body *map[stri
 			return err
 		}
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_encode").Observe(time.Since(dataEncodeStartTs).Seconds())
 
 	err = db.BigtableClient.SaveMachineMetric(parsedMeta.Process, userData.ID, machine, data)
 	if err != nil {

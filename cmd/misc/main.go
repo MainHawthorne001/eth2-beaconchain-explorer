@@ -3,19 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
-
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"eth2-exporter/cmd/misc/commands"
-	"eth2-exporter/db"
-	"eth2-exporter/exporter"
-	"eth2-exporter/ratelimit"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
+	"flag"
 	"fmt"
 	"math"
 	"math/big"
@@ -25,19 +16,27 @@ import (
 	"sync"
 	"time"
 
+	"firebase.google.com/go/v4/messaging"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/cmd/misc/commands"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/exporter"
+	"github.com/gobitfly/eth2-beaconchain-explorer/notify"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/gobitfly/eth2-beaconchain-explorer/version"
+
+	"github.com/Gurpartap/storekit-go"
 	"github.com/coocood/freecache"
 	"github.com/ethereum/go-ethereum/common"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pkg/errors"
 	utilMath "github.com/protolambda/zrnt/eth2/util/math"
+	"github.com/sirupsen/logrus"
 	go_ens "github.com/wealdtech/go-ens/v3"
 	"golang.org/x/sync/errgroup"
-
-	"flag"
-
-	"github.com/Gurpartap/storekit-go"
-
-	"github.com/sirupsen/logrus"
 )
 
 var opts = struct {
@@ -61,17 +60,21 @@ var opts = struct {
 	Key                 string
 	ValidatorNameRanges string
 	Email               string
+	Name                string
 	DryRun              bool
 	Yes                 bool
 }{}
 
+var bt *db.Bigtable
+var erigonClient *rpc.ErigonClient
 var lighthouseClient *rpc.LighthouseClient
+var rpcClient *rpc.LighthouseClient
 
 func main() {
 	statsPartitionCommand := commands.StatsMigratorCommand{}
 
 	configPath := flag.String("config", "config/default.config.yml", "Path to the config file")
-	flag.StringVar(&opts.Command, "command", "", "command to run, available: updateAPIKey, applyDbSchema, initBigtableSchema, epoch-export, debug-rewards, debug-blocks, clear-bigtable, index-old-eth1-blocks, update-aggregation-bits, historic-prices-export, index-missing-blocks, export-epoch-missed-slots, migrate-last-attestation-slot-bigtable, export-genesis-validators, update-block-finalization-sequentially, nameValidatorsByRanges, export-stats-totals, export-sync-committee-periods, export-sync-committee-validator-stats, partition-validator-stats, migrate-app-purchases, update-ratelimits, disable-user-per-email")
+	flag.StringVar(&opts.Command, "command", "", "command to run, available: updateAPIKey, applyDbSchema, initBigtableSchema, epoch-export, debug-rewards, debug-blocks, clear-bigtable, index-old-eth1-blocks, update-aggregation-bits, historic-prices-export, index-missing-blocks, re-index-blocks, export-epoch-missed-slots, migrate-last-attestation-slot-bigtable, export-genesis-validators, update-block-finalization-sequentially, nameValidatorsByRanges, export-stats-totals, export-sync-committee-periods, export-sync-committee-validator-stats, partition-validator-stats, migrate-app-purchases, disable-user-per-email, validate-firebase-tokens")
 	flag.Uint64Var(&opts.StartEpoch, "start-epoch", 0, "start epoch")
 	flag.Uint64Var(&opts.EndEpoch, "end-epoch", 0, "end epoch")
 	flag.Uint64Var(&opts.User, "user", 0, "user id")
@@ -91,6 +94,7 @@ func main() {
 	flag.StringVar(&opts.Addresses, "addresses", "", "Comma separated list of addresses that should be processed by the command")
 	flag.StringVar(&opts.Columns, "columns", "", "Comma separated list of columns that should be affected by the command")
 	flag.StringVar(&opts.Email, "email", "", "Email of the user")
+	flag.StringVar(&opts.Name, "name", "", "Name")
 	flag.BoolVar(&opts.Yes, "yes", false, "Answer yes to all questions")
 	dryRun := flag.String("dry-run", "true", "if 'false' it deletes all rows starting with the key, per default it only logs the rows that would be deleted, but does not really delete them")
 	versionFlag := flag.Bool("version", false, "Show version and exit")
@@ -115,60 +119,90 @@ func main() {
 	utils.Config = cfg
 
 	chainIdString := strconv.FormatUint(utils.Config.Chain.ClConfig.DepositChainID, 10)
-
-	bt, err := db.InitBigtable(utils.Config.Bigtable.Project, utils.Config.Bigtable.Instance, chainIdString, utils.Config.RedisCacheEndpoint)
-	if err != nil {
-		utils.LogFatal(err, "error initializing bigtable", 0)
-	}
-
 	chainIDBig := new(big.Int).SetUint64(utils.Config.Chain.ClConfig.DepositChainID)
-	rpcClient, err := rpc.NewLighthouseClient("http://"+cfg.Indexer.Node.Host+":"+cfg.Indexer.Node.Port, chainIDBig)
-	if err != nil {
-		utils.LogFatal(err, "lighthouse client error", 0)
-	}
-	lighthouseClient = rpcClient
 
-	erigonClient, err := rpc.NewErigonClient(utils.Config.Eth1ErigonEndpoint)
-	if err != nil {
-		logrus.Fatalf("error initializing erigon client: %v", err)
-	}
+	wg := &sync.WaitGroup{}
+	wg.Add(5)
 
-	db.MustInitDB(&types.DatabaseConfig{
-		Username:     cfg.WriterDatabase.Username,
-		Password:     cfg.WriterDatabase.Password,
-		Name:         cfg.WriterDatabase.Name,
-		Host:         cfg.WriterDatabase.Host,
-		Port:         cfg.WriterDatabase.Port,
-		MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
-	}, &types.DatabaseConfig{
-		Username:     cfg.ReaderDatabase.Username,
-		Password:     cfg.ReaderDatabase.Password,
-		Name:         cfg.ReaderDatabase.Name,
-		Host:         cfg.ReaderDatabase.Host,
-		Port:         cfg.ReaderDatabase.Port,
-		MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
-	})
+	go func() {
+		defer wg.Done()
+		var err error
+		bt, err = db.InitBigtable(utils.Config.Bigtable.Project, utils.Config.Bigtable.Instance, chainIdString, utils.Config.RedisCacheEndpoint)
+		if err != nil {
+			utils.LogFatal(err, "error initializing bigtable", 0)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		var err error
+		rpcClient, err = rpc.NewLighthouseClient("http://"+cfg.Indexer.Node.Host+":"+cfg.Indexer.Node.Port, chainIDBig)
+		if err != nil {
+			utils.LogFatal(err, "lighthouse client error", 0)
+		}
+		lighthouseClient = rpcClient
+	}()
+
+	go func() {
+		defer wg.Done()
+		var err error
+		erigonClient, err = rpc.NewErigonClient(utils.Config.Eth1ErigonEndpoint)
+		if err != nil {
+			logrus.Fatalf("error initializing erigon client: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		db.MustInitDB(&types.DatabaseConfig{
+			Username:     cfg.WriterDatabase.Username,
+			Password:     cfg.WriterDatabase.Password,
+			Name:         cfg.WriterDatabase.Name,
+			Host:         cfg.WriterDatabase.Host,
+			Port:         cfg.WriterDatabase.Port,
+			MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.WriterDatabase.SSL,
+		}, &types.DatabaseConfig{
+			Username:     cfg.ReaderDatabase.Username,
+			Password:     cfg.ReaderDatabase.Password,
+			Name:         cfg.ReaderDatabase.Name,
+			Host:         cfg.ReaderDatabase.Host,
+			Port:         cfg.ReaderDatabase.Port,
+			MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
+			SSL:          cfg.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
+	}()
+
+	go func() {
+		defer wg.Done()
+		db.MustInitFrontendDB(&types.DatabaseConfig{
+			Username:     cfg.Frontend.WriterDatabase.Username,
+			Password:     cfg.Frontend.WriterDatabase.Password,
+			Name:         cfg.Frontend.WriterDatabase.Name,
+			Host:         cfg.Frontend.WriterDatabase.Host,
+			Port:         cfg.Frontend.WriterDatabase.Port,
+			MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.WriterDatabase.SSL,
+		}, &types.DatabaseConfig{
+			Username:     cfg.Frontend.ReaderDatabase.Username,
+			Password:     cfg.Frontend.ReaderDatabase.Password,
+			Name:         cfg.Frontend.ReaderDatabase.Name,
+			Host:         cfg.Frontend.ReaderDatabase.Host,
+			Port:         cfg.Frontend.ReaderDatabase.Port,
+			MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
+	}()
+
+	wg.Wait()
+
 	defer db.ReaderDb.Close()
 	defer db.WriterDb.Close()
-	db.MustInitFrontendDB(&types.DatabaseConfig{
-		Username:     cfg.Frontend.WriterDatabase.Username,
-		Password:     cfg.Frontend.WriterDatabase.Password,
-		Name:         cfg.Frontend.WriterDatabase.Name,
-		Host:         cfg.Frontend.WriterDatabase.Host,
-		Port:         cfg.Frontend.WriterDatabase.Port,
-		MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
-	}, &types.DatabaseConfig{
-		Username:     cfg.Frontend.ReaderDatabase.Username,
-		Password:     cfg.Frontend.ReaderDatabase.Password,
-		Name:         cfg.Frontend.ReaderDatabase.Name,
-		Host:         cfg.Frontend.ReaderDatabase.Host,
-		Port:         cfg.Frontend.ReaderDatabase.Port,
-		MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
-	})
+
 	defer db.FrontendReaderDB.Close()
 	defer db.FrontendWriterDB.Close()
 
@@ -283,6 +317,8 @@ func main() {
 		exportHistoricPrices(opts.StartDay, opts.EndDay)
 	case "index-missing-blocks":
 		indexMissingBlocks(opts.StartBlock, opts.EndBlock, bt, erigonClient)
+	case "re-index-blocks":
+		reIndexBlocks(opts.StartBlock, opts.EndBlock, bt, erigonClient, opts.Transformers, opts.BatchSize, opts.DataConcurrency)
 	case "migrate-last-attestation-slot-bigtable":
 		migrateLastAttestationSlotToBigtable()
 	case "migrate-app-purchases":
@@ -399,14 +435,16 @@ func main() {
 		err = fixEns(erigonClient)
 	case "fix-ens-addresses":
 		err = fixEnsAddresses(erigonClient)
-	case "update-ratelimits":
-		ratelimit.DBUpdater()
 	case "disable-user-per-email":
 		err = disableUserPerEmail()
 	case "fix-epochs":
 		err = fixEpochs()
+	case "fix-internal-txs-from-node":
+		fixInternalTxsFromNode(opts.StartBlock, opts.EndBlock, opts.BatchSize, opts.DataConcurrency, bt)
+	case "validate-firebase-tokens":
+		err = validateFirebaseTokens()
 	default:
-		utils.LogFatal(nil, fmt.Sprintf("unknown command %s", opts.Command), 0)
+		utils.LogFatal(nil, fmt.Sprintf("unknown command %s", opts.Command), 2)
 	}
 
 	if err != nil {
@@ -507,8 +545,54 @@ func disableUserPerEmail() error {
 	return nil
 }
 
+func fixInternalTxsFromNode(startBlock, endBlock, batchSize, concurrency uint64, bt *db.Bigtable) {
+	if endBlock > 0 && endBlock < startBlock {
+		utils.LogError(nil, fmt.Sprintf("endBlock [%v] < startBlock [%v]", endBlock, startBlock), 0)
+		return
+	}
+
+	if concurrency == 0 {
+		utils.LogError(nil, "concurrency must be greater than 0", 0)
+		return
+	}
+	if bt == nil {
+		utils.LogError(nil, "no bigtable provided", 0)
+		return
+	}
+
+	transformers := make([]func(blk *types.Eth1Block, cache *freecache.Cache) (*types.BulkMutations, *types.BulkMutations, error), 0)
+	transformers = append(transformers, bt.TransformBlock, bt.TransformTx, bt.TransformItx)
+
+	to := endBlock
+	if endBlock == math.MaxInt64 {
+		lastBlockFromBlocksTable, err := bt.GetLastBlockInBlocksTable()
+		if err != nil {
+			utils.LogError(err, "error retrieving last blocks from blocks table", 0)
+			return
+		}
+
+		to = uint64(lastBlockFromBlocksTable)
+	}
+
+	cache := freecache.NewCache(100 * 1024 * 1024) // 100 MB limit
+	blockCount := utilMath.MaxU64(1, batchSize)
+
+	logrus.Infof("Starting to reindex all txs for blocks ranging from %d to %d", startBlock, to)
+	for from := startBlock; from <= to; from = from + blockCount {
+		toBlock := utilMath.MinU64(to, from+blockCount-1)
+
+		logrus.Infof("reindexing txs for blocks from height %v to %v in data table ...", from, toBlock)
+		err := bt.ReindexITxsFromNode(int64(from), int64(toBlock), int64(batchSize), int64(concurrency), transformers, cache)
+		if err != nil {
+			utils.LogError(err, "error indexing from bigtable", 0)
+		}
+		cache.Clear()
+
+	}
+}
+
 func fixEns(erigonClient *rpc.ErigonClient) error {
-	logrus.Infof("command: fix-ens")
+	logrus.WithField("dry", opts.DryRun).Infof("command: fix-ens")
 	addrs := []struct {
 		Address []byte `db:"address"`
 		EnsName string `db:"ens_name"`
@@ -570,7 +654,7 @@ func fixEns(erigonClient *rpc.ErigonClient) error {
 				reverseName, err := go_ens.ReverseResolve(erigonClient.GetNativeClient(), dbAddr)
 				if err != nil {
 					if err.Error() == "not a resolver" || err.Error() == "no resolution" {
-						logrus.WithFields(logrus.Fields{"addr": fmt.Sprintf("%#x", addr.Address), "name": addr.EnsName, "reason": fmt.Sprintf("failed reverse-resolve: %v", err.Error())}).Warnf("updating ens entry: is_primary_name = false")
+						logrus.WithFields(logrus.Fields{"addr": dbAddr, "name": addr.EnsName, "reason": fmt.Sprintf("failed reverse-resolve: %v", err.Error())}).Warnf("updating ens entry: is_primary_name = false")
 						if !opts.DryRun {
 							_, err = db.WriterDb.Exec(`update ens set is_primary_name = false where address = $1 and ens_name = $2`, addr.Address, addr.EnsName)
 							if err != nil {
@@ -1045,7 +1129,7 @@ func debugBlocks() error {
 		}
 		// logrus.WithFields(logrus.Fields{"block": i, "data": fmt.Sprintf("%+v", b)}).Infof("block from bt")
 
-		elBlock, _, err := elClient.GetBlock(int64(i), "parity/geth")
+		elBlock, _, err := elClient.GetBlock(int64(i), "geth")
 		if err != nil {
 			return err
 		}
@@ -1513,7 +1597,7 @@ func indexMissingBlocks(start uint64, end uint64, bt *db.Bigtable, client *rpc.E
 			if _, err := db.BigtableClient.GetBlockFromBlocksTable(block); err != nil {
 				logrus.Infof("could not load [%v] from blocks table, will try to fetch it from the node and save it", block)
 
-				bc, _, err := client.GetBlock(int64(block), "parity/geth")
+				bc, _, err := client.GetBlock(int64(block), "geth")
 				if err != nil {
 					utils.LogError(err, fmt.Sprintf("error getting block %v from the node", block), 0)
 					return
@@ -1531,21 +1615,115 @@ func indexMissingBlocks(start uint64, end uint64, bt *db.Bigtable, client *rpc.E
 	}
 }
 
-func indexOldEth1Blocks(startBlock uint64, endBlock uint64, batchSize uint64, concurrency uint64, transformerFlag string, bt *db.Bigtable, client *rpc.ErigonClient) {
-	if endBlock > 0 && endBlock < startBlock {
-		utils.LogError(nil, fmt.Sprintf("endBlock [%v] < startBlock [%v]", endBlock, startBlock), 0)
+// Goes through the blocks in the given range from [start] to [end] and re indexes them with the provided transformers
+//
+//	Both [start] and [end] are inclusive
+//	Pass math.MaxInt64 as [end] to export from [start] to the last block in the blocks table
+func reIndexBlocks(start uint64, end uint64, bt *db.Bigtable, client *rpc.ErigonClient, transformerFlag string, batchSize uint64, concurrency uint64) {
+	if start > 0 && end < start {
+		utils.LogError(nil, fmt.Sprintf("endBlock [%v] < startBlock [%v]", end, start), 0)
 		return
 	}
 	if concurrency == 0 {
 		utils.LogError(nil, "concurrency must be greater than 0", 0)
 		return
 	}
-	if bt == nil {
-		utils.LogError(nil, "no bigtable provided", 0)
+	if end == math.MaxInt64 {
+		lastBlockFromBlocksTable, err := bt.GetLastBlockInBlocksTable()
+		if err != nil {
+			logrus.Errorf("error retrieving last blocks from blocks table: %v", err)
+			return
+		}
+		end = uint64(lastBlockFromBlocksTable)
+	}
+	transformers, importENSChanges, err := getTransformers(transformerFlag, bt)
+	if err != nil {
+		utils.LogError(nil, err, 0)
 		return
 	}
+	if importENSChanges {
+		if err := bt.ImportEnsUpdates(client.GetNativeClient(), math.MaxInt64); err != nil {
+			utils.LogError(err, "error importing ens from events", 0)
+			return
+		}
+	}
 
-	transforms := make([]func(blk *types.Eth1Block, cache *freecache.Cache) (*types.BulkMutations, *types.BulkMutations, error), 0)
+	readGroup := errgroup.Group{}
+	readGroup.SetLimit(int(concurrency))
+
+	writeGroup := errgroup.Group{}
+	writeGroup.SetLimit(int(concurrency*concurrency) + 1)
+
+	cache := freecache.NewCache(100 * 1024 * 1024) // 100 MB limit
+	quit := make(chan struct{})
+
+	sink := make(chan *types.Eth1Block)
+	writeGroup.Go(func() error {
+		for {
+			select {
+			case block, ok := <-sink:
+				if !ok {
+					return nil
+				}
+				writeGroup.Go(func() error {
+					if err := bt.SaveBlock(block); err != nil {
+						return fmt.Errorf("error saving block %v: %w", block.Number, err)
+					}
+					err := bt.IndexBlocksWithTransformers([]*types.Eth1Block{block}, transformers, cache)
+					if err != nil {
+						return fmt.Errorf("error indexing from bigtable: %w", err)
+					}
+					logrus.Infof("%d indexed", block.Number)
+					return nil
+				})
+			case <-quit:
+				return nil
+			}
+		}
+	})
+
+	var errs []error
+	var mu sync.Mutex
+	for i := start; i <= end; i = i + batchSize {
+		height := int64(i)
+		readGroup.Go(func() error {
+			heightEnd := height + int64(batchSize) - 1
+			if heightEnd > int64(end) {
+				heightEnd = int64(end)
+			}
+			blocks, err := client.GetBlocks(height, heightEnd, "geth")
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("cannot read block range %d-%d: %w", height, heightEnd, err))
+				mu.Unlock()
+				logrus.WithFields(map[string]interface{}{
+					"message": err.Error(),
+					"start":   height,
+					"end":     heightEnd,
+				}).Error("cannot read block range")
+				return nil
+			}
+			for _, block := range blocks {
+				sink <- block
+			}
+			return nil
+		})
+	}
+	if err := readGroup.Wait(); err != nil {
+		panic(err)
+	}
+	for _, err := range errs {
+		logrus.Error(err.Error())
+	}
+	quit <- struct{}{}
+	close(sink)
+	if err := writeGroup.Wait(); err != nil {
+		panic(err)
+	}
+}
+
+func getTransformers(transformerFlag string, bt *db.Bigtable) ([]db.TransformFunc, bool, error) {
+	transforms := make([]db.TransformFunc, 0)
 
 	logrus.Infof("transformerFlag: %v", transformerFlag)
 	transformerList := strings.Split(transformerFlag, ",")
@@ -1553,13 +1731,11 @@ func indexOldEth1Blocks(startBlock uint64, endBlock uint64, batchSize uint64, co
 		transformerList = []string{"TransformBlock", "TransformTx", "TransformBlobTx", "TransformItx", "TransformERC20", "TransformERC721", "TransformERC1155", "TransformWithdrawals", "TransformUncle", "TransformEnsNameRegistered", "TransformContract"}
 	} else if len(transformerList) == 0 {
 		utils.LogError(nil, "no transformer functions provided", 0)
-		return
+		return nil, false, fmt.Errorf("no transformer functions provided")
 	}
 	logrus.Infof("transformers: %v", transformerList)
+
 	importENSChanges := false
-	/**
-	* Add additional transformers you want to sync to this switch case
-	**/
 	for _, t := range transformerList {
 		switch t {
 		case "TransformBlock":
@@ -1586,9 +1762,30 @@ func indexOldEth1Blocks(startBlock uint64, endBlock uint64, batchSize uint64, co
 		case "TransformContract":
 			transforms = append(transforms, bt.TransformContract)
 		default:
-			utils.LogError(nil, "Invalid transformer flag %v", 0)
-			return
+			return nil, false, fmt.Errorf("invalid transformer flag %v", t)
 		}
+	}
+	return transforms, importENSChanges, nil
+}
+
+func indexOldEth1Blocks(startBlock uint64, endBlock uint64, batchSize uint64, concurrency uint64, transformerFlag string, bt *db.Bigtable, client *rpc.ErigonClient) {
+	if endBlock > 0 && endBlock < startBlock {
+		utils.LogError(nil, fmt.Sprintf("endBlock [%v] < startBlock [%v]", endBlock, startBlock), 0)
+		return
+	}
+	if concurrency == 0 {
+		utils.LogError(nil, "concurrency must be greater than 0", 0)
+		return
+	}
+	if bt == nil {
+		utils.LogError(nil, "no bigtable provided", 0)
+		return
+	}
+
+	transforms, importENSChanges, err := getTransformers(transformerFlag, bt)
+	if err != nil {
+		utils.LogError(nil, err, 0)
+		return
 	}
 
 	cache := freecache.NewCache(100 * 1024 * 1024) // 100 MB limit
@@ -2061,4 +2258,50 @@ func askForConfirmation(q string) bool {
 		return true
 	}
 	return false
+}
+
+func validateFirebaseTokens() error {
+	// retrieve all userIds and tokens from the database
+
+	var users []struct {
+		ID    uint64 `db:"user_id"`
+		Token string `db:"notification_token"`
+	}
+
+	err := db.FrontendWriterDB.Select(&users, `select DISTINCT ON (user_id, notification_token) user_id, notification_token from users_devices where length(notification_token) > 20 and user_id = xxx;`)
+
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	// badge := 1
+	for _, user := range users {
+		// validate the token by trying to send a message to the user
+
+		notification := new(messaging.Notification)
+		notification.Title = "test"
+		notification.Body = "this is a test message"
+
+		message := new(messaging.Message)
+		message.Notification = notification
+		message.Token = user.Token
+
+		message.APNS = new(messaging.APNSConfig)
+		message.APNS.Payload = new(messaging.APNSPayload)
+		message.APNS.Payload.Aps = new(messaging.Aps)
+		message.APNS.Payload.Aps.Sound = "default"
+		// message.APNS.Payload.Aps.Badge = &badge
+		// message.APNS.Payload.Aps.AlertString = "test"
+
+		meassages := []*messaging.Message{
+			message,
+		}
+
+		err := notify.SendPushBatch(meassages, false)
+		if err != nil {
+			logrus.Fatal(err)
+		}
+	}
+
+	return nil
 }
